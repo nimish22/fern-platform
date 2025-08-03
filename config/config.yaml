@@ -1,7 +1,7 @@
 # Fern Platform Configuration
 
 server:
-  port: 8080
+  port: 9091
   host: "0.0.0.0"
   readTimeout: "30s"
   writeTimeout: "30s"
@@ -26,13 +26,27 @@ database:
   connMaxIdleTime: "300s"
 
 auth:
-  enabled: false
+  enabled: true
   jwtSecret: ""
   jwksUrl: ""
   issuer: ""
   audience: ""
   tokenExpiry: "24h"
   refreshExpiry: "168h"
+  oauth:
+    enabled: true
+    clientId: "0oa2dp0elqsYZfmKU0h8"
+    clientSecret: ""
+    redirectUrl: "http://localhost:9091/auth/callback"
+    scopes: [ "openid", "profile", "email", "groups" ]
+
+    # OAuth endpoints (required)
+    authUrl: "https://guidewire-hub.oktapreview.com/oauth2/ausj9ftnbxOqfGU4U0h7/v1/authorize"
+    tokenUrl: "https://guidewire-hub.oktapreview.com/oauth2/ausj9ftnbxOqfGU4U0h7/v1/token"
+    userInfoUrl: "https://guidewire-hub.oktapreview.com/oauth2/ausj9ftnbxOqfGU4U0h7/v1/userinfo"
+    jwksUrl: "https://guidewire-hub.oktapreview.com/oauth2/default/v1/keys"
+    logoutUrl: "https://guidewire-hub.oktapreview.com/oauth2/ausj9ftnbxOqfGU4U0h7/v1/logout"
+
 
 logging:
   level: "info"
@@ -43,7 +57,7 @@ logging:
 services:
   reporter:
     host: "localhost"
-    port: 8080
+    port: 9091
     url: "http://localhost:8080"
   mycelium:
     host: "localhost"

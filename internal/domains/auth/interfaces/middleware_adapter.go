@@ -1,6 +1,9 @@
 package interfaces
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -120,6 +123,22 @@ func (m *AuthMiddlewareAdapter) RequireManager() gin.HandlerFunc {
 	}
 }
 
+// generateCodeVerifier creates a random 43-128 character string
+func generateCodeVerifier() (string, error) {
+	verifierBytes := make([]byte, 32)
+	_, err := rand.Read(verifierBytes)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(verifierBytes), nil
+}
+
+// generateCodeChallenge creates a base64url-encoded SHA256 hash of the verifier
+func generateCodeChallenge(verifier string) string {
+	hash := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(hash[:])
+}
+
 // StartOAuthFlow initiates the OAuth authentication flow
 func (m *AuthMiddlewareAdapter) StartOAuthFlow() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -140,8 +159,28 @@ func (m *AuthMiddlewareAdapter) StartOAuthFlow() gin.HandlerFunc {
 		isSecure := c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
 		c.SetCookie("oauth_state", state, 600, "/", "", isSecure, true) // 10 minutes
 
-		// Build authorization URL
-		authURL := m.oauthAdapter.BuildAuthURL(state)
+		authURL := ""
+		if m.config.OAuth.ClientSecret == "" {
+			// PKCE Auth Flow
+
+			// Generate code_verifier and code_challenge
+			codeVerifier, err := generateCodeVerifier()
+			if err != nil {
+				m.logger.WithError(err).Error("Failed to generate PKCE code_verifier")
+				c.JSON(500, gin.H{"error": "Failed to generate PKCE verifier"})
+				return
+			}
+			codeChallenge := generateCodeChallenge(codeVerifier)
+
+			// Store pkce_verifier in session/cookie for validation
+			c.SetCookie("pkce_verifier", codeVerifier, 600, "/", "", isSecure, true)
+
+			// Build auth URL with PKCE parameters
+			authURL = m.oauthAdapter.buildAuthURLWithPKCE(state, codeChallenge)
+		} else {
+			// Build authorization URL
+			authURL = m.oauthAdapter.BuildAuthURL(state)
+		}
 
 		c.Redirect(302, authURL)
 	}
@@ -171,8 +210,11 @@ func (m *AuthMiddlewareAdapter) HandleOAuthCallback() gin.HandlerFunc {
 			return
 		}
 
+		// Get code_verifier from cookie - this will dictate if we are using PKCE
+		codeVerifier, _ := c.Cookie("pkce_verifier")
+
 		// Exchange code for token
-		tokenInfo, err := m.oauthAdapter.ExchangeCodeForToken(code)
+		tokenInfo, err := m.oauthAdapter.ExchangeCodeForToken(code, codeVerifier)
 		if err != nil {
 			m.logger.WithError(err).Error("Failed to exchange code for token")
 			c.JSON(400, gin.H{"error": "Token exchange failed"})
