@@ -1,6 +1,7 @@
 package interfaces
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -14,20 +15,38 @@ import (
 	"github.com/guidewire-oss/fern-platform/pkg/logging"
 )
 
+// AuthService defines the subset of AuthenticationService behavior the middleware needs.
+// Concrete application.AuthenticationService should implement these methods.
+type AuthService interface {
+	ValidateSession(ctx context.Context, sid string) (*domain.Session, error)
+	AuthenticateWithOAuth(ctx context.Context, userInfo application.UserInfo, t application.TokenInfo, ip, ua string) (*application.AuthenticateResult, error)
+	Logout(ctx context.Context, sid string) error
+}
+
+// OAuthAdapterIface defines the subset of OAuth adapter behavior the middleware needs.
+// The concrete OAuthAdapter should implement these methods.
+type OAuthAdapterIface interface {
+	GenerateState() (string, error)
+	BuildAuthURL(state string, codeChallenge ...string) string
+	ExchangeCodeForToken(code, verifier string) (*application.TokenInfo, error)
+	GetUserInfo(accessToken string) (*application.UserInfo, error)
+	BuildProviderLogoutURL(idToken string) string
+}
+
 // AuthMiddlewareAdapter provides Gin middleware using auth domain services
 type AuthMiddlewareAdapter struct {
-	authService  *application.AuthenticationService
+	authService  AuthService
 	authzService *application.AuthorizationService
-	oauthAdapter *OAuthAdapter
+	oauthAdapter OAuthAdapterIface
 	config       *config.AuthConfig
 	logger       *logging.Logger
 }
 
 // NewAuthMiddlewareAdapter creates a new auth middleware adapter
 func NewAuthMiddlewareAdapter(
-	authService *application.AuthenticationService,
+	authService AuthService,
 	authzService *application.AuthorizationService,
-	oauthAdapter *OAuthAdapter,
+	oauthAdapter OAuthAdapterIface,
 	config *config.AuthConfig,
 	logger *logging.Logger,
 ) *AuthMiddlewareAdapter {
@@ -53,11 +72,10 @@ func (m *AuthMiddlewareAdapter) RequireAuth() gin.HandlerFunc {
 		// 1. Try to get token from Authorization header
 		authHeader := c.GetHeader("Authorization")
 
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			accessToken := strings.TrimPrefix(authHeader, "Bearer ")
-
+		authHeaderLower := strings.ToLower(authHeader)
+		if strings.HasPrefix(authHeaderLower, "bearer ") {
+			accessToken := authHeader[7:]
 			// Extract user info and craete session
-
 			// Get user info
 			userInfo, err := m.oauthAdapter.GetUserInfo(accessToken)
 			if err != nil {
@@ -120,10 +138,16 @@ func (m *AuthMiddlewareAdapter) RequireAdmin() gin.HandlerFunc {
 
 		user, exists := m.getUserFromContext(c)
 		if !exists || !user.IsAdmin() {
-			m.logger.WithRequest(c.GetString("request_id"), c.Request.Method, c.Request.URL.Path).
-				WithField("user_id", user.UserID).
-				WithField("user_role", user.Role).
-				Warn("Admin access denied - insufficient privileges")
+			// guard against nil user fields in logs
+			if user != nil {
+				m.logger.WithRequest(c.GetString("request_id"), c.Request.Method, c.Request.URL.Path).
+					WithField("user_id", user.UserID).
+					WithField("user_role", user.Role).
+					Warn("Admin access denied - insufficient privileges")
+			} else {
+				m.logger.WithRequest(c.GetString("request_id"), c.Request.Method, c.Request.URL.Path).
+					Warn("Admin access denied - insufficient privileges (no user in context)")
+			}
 
 			if m.isAPIRequest(c) {
 				c.JSON(403, gin.H{"error": "Admin privileges required"})
@@ -165,8 +189,8 @@ func (m *AuthMiddlewareAdapter) RequireManager() gin.HandlerFunc {
 	}
 }
 
-// generateCodeVerifier creates a random 43-128 character string
-func generateCodeVerifier() (string, error) {
+// GenerateCodeVerifier creates a random 43-128 character string
+func GenerateCodeVerifier() (string, error) {
 	verifierBytes := make([]byte, 32)
 	_, err := rand.Read(verifierBytes)
 	if err != nil {
@@ -175,8 +199,8 @@ func generateCodeVerifier() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(verifierBytes), nil
 }
 
-// generateCodeChallenge creates a base64url-encoded SHA256 hash of the verifier
-func generateCodeChallenge(verifier string) string {
+// GenerateCodeChallenge creates a base64url-encoded SHA256 hash of the verifier
+func GenerateCodeChallenge(verifier string) string {
 	hash := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
@@ -206,13 +230,13 @@ func (m *AuthMiddlewareAdapter) StartOAuthFlow() gin.HandlerFunc {
 			// PKCE Auth Flow
 
 			// Generate code_verifier and code_challenge
-			codeVerifier, err := generateCodeVerifier()
+			codeVerifier, err := GenerateCodeVerifier()
 			if err != nil {
 				m.logger.WithError(err).Error("Failed to generate PKCE code_verifier")
 				c.JSON(500, gin.H{"error": "Failed to generate PKCE verifier"})
 				return
 			}
-			codeChallenge := generateCodeChallenge(codeVerifier)
+			codeChallenge := GenerateCodeChallenge(codeVerifier)
 
 			// Store pkce_verifier in session/cookie for validation
 			c.SetCookie("pkce_verifier", codeVerifier, 600, "/", "", isSecure, true)

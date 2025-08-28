@@ -483,6 +483,10 @@ func (m *Manager) validate(config *Config) error {
 	return nil
 }
 
+func (m *Manager) GetString(key string) string {
+	return viper.GetString(key)
+}
+
 // GetConfig returns the global configuration instance
 func GetConfig() *Config {
 	if globalConfig == nil {

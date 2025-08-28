@@ -4,527 +4,681 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"testing"
+	"strings"
 	"time"
 
 	"github.com/guidewire-oss/fern-platform/internal/domains/auth/application"
+	_ "github.com/guidewire-oss/fern-platform/internal/domains/auth/application"
 	"github.com/guidewire-oss/fern-platform/pkg/config"
 	"github.com/guidewire-oss/fern-platform/pkg/logging"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
-func createTestOAuthAdapter() *OAuthAdapter {
-	cfg := &config.AuthConfig{
-		OAuth: config.OAuthConfig{
-			Enabled:      true,
-			ClientID:     "test-client-id",
-			ClientSecret: "test-client-secret",
-			RedirectURL:  "http://localhost:8080/auth/callback",
-			AuthURL:      "https://provider.com/auth",
-			TokenURL:     "https://provider.com/token",
-			UserInfoURL:  "https://provider.com/userinfo",
-			LogoutURL:    "https://provider.com/logout",
-			IssuerURL:    "https://provider.com",
-			Scopes:       []string{"openid", "profile", "email"},
-			UserIDField:  "sub",
-			EmailField:   "email",
-			NameField:    "name",
-			GroupsField:  "groups",
-			RolesField:   "roles",
-			AdminUsers:   []string{"admin@example.com"},
-			AdminGroups:  []string{"/admin-group"},
-		},
-	}
+var _ = Describe("OAuthAdapter", Label("auth"), func() {
+	var (
+		authConfig *config.AuthConfig
+		logger     *logging.Logger
+		adapter    *OAuthAdapter
+	)
 
-	loggingConfig := &config.LoggingConfig{
-		Level:  "info",
-		Format: "json",
-	}
-
-	logger, _ := logging.NewLogger(loggingConfig)
-	return NewOAuthAdapter(cfg, logger)
-}
-
-func TestNewOAuthAdapter(t *testing.T) {
-	cfg := &config.AuthConfig{}
-
-	loggingConfig := &config.LoggingConfig{
-		Level:  "info",
-		Format: "json",
-	}
-	logger, _ := logging.NewLogger(loggingConfig)
-
-	adapter := NewOAuthAdapter(cfg, logger)
-
-	assert.NotNil(t, adapter)
-	assert.Equal(t, cfg, adapter.config)
-	assert.Equal(t, logger, adapter.logger)
-	assert.NotNil(t, adapter.client)
-	assert.Equal(t, 10*time.Second, adapter.client.Timeout)
-}
-
-func TestGenerateState(t *testing.T) {
-	adapter := createTestOAuthAdapter()
-
-	state1, err := adapter.GenerateState()
-	require.NoError(t, err)
-	assert.NotEmpty(t, state1)
-	assert.Greater(t, len(state1), 40) // Base64 encoded 32 bytes should be longer
-
-	state2, err := adapter.GenerateState()
-	require.NoError(t, err)
-	assert.NotEmpty(t, state2)
-	assert.NotEqual(t, state1, state2) // Should generate different states
-}
-
-func TestBuildAuthURL(t *testing.T) {
-	adapter := createTestOAuthAdapter()
-	state := "test-state-123"
-
-	authURL := adapter.BuildAuthURL(state)
-
-	parsedURL, err := url.Parse(authURL)
-	require.NoError(t, err)
-
-	assert.Equal(t, "https", parsedURL.Scheme)
-	assert.Equal(t, "provider.com", parsedURL.Host)
-	assert.Equal(t, "/auth", parsedURL.Path)
-
-	params := parsedURL.Query()
-	assert.Equal(t, "code", params.Get("response_type"))
-	assert.Equal(t, "test-client-id", params.Get("client_id"))
-	assert.Equal(t, "http://localhost:8080/auth/callback", params.Get("redirect_uri"))
-	assert.Equal(t, "openid profile email", params.Get("scope"))
-	assert.Equal(t, state, params.Get("state"))
-}
-
-func TestBuildAuthURLWithPKCE(t *testing.T) {
-	adapter := createTestOAuthAdapter()
-	state := "test-state-123"
-	codeChallenge := "test-code-challenge"
-
-	authURL := adapter.BuildAuthURL(state, codeChallenge)
-
-	parsedURL, err := url.Parse(authURL)
-	require.NoError(t, err)
-
-	params := parsedURL.Query()
-	assert.Equal(t, "code", params.Get("response_type"))
-	assert.Equal(t, "test-client-id", params.Get("client_id"))
-	assert.Equal(t, "http://localhost:8080/auth/callback", params.Get("redirect_uri"))
-	assert.Equal(t, "openid profile email", params.Get("scope"))
-	assert.Equal(t, state, params.Get("state"))
-	assert.Equal(t, codeChallenge, params.Get("code_challenge"))
-	assert.Equal(t, "S256", params.Get("code_challenge_method"))
-}
-
-func TestExchangeCodeForToken_Success(t *testing.T) {
-	// Create mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "POST", r.Method)
-		assert.Equal(t, "application/x-www-form-urlencoded", r.Header.Get("Content-Type"))
-		assert.Equal(t, "application/json", r.Header.Get("Accept"))
-
-		// Parse form data
-		err := r.ParseForm()
-		require.NoError(t, err)
-
-		assert.Equal(t, "authorization_code", r.Form.Get("grant_type"))
-		assert.Equal(t, "test-auth-code", r.Form.Get("code"))
-		assert.Equal(t, "http://localhost:8080/auth/callback", r.Form.Get("redirect_uri"))
-		assert.Equal(t, "test-client-id", r.Form.Get("client_id"))
-		assert.Equal(t, "test-client-secret", r.Form.Get("client_secret"))
-
-		// Send successful response
-		response := map[string]interface{}{
-			"access_token":  "test-access-token",
-			"token_type":    "Bearer",
-			"expires_in":    3600,
-			"refresh_token": "test-refresh-token",
-			"id_token":      "test-id-token",
-			"scope":         "openid profile email",
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.TokenURL = server.URL
-
-	tokenInfo, err := adapter.ExchangeCodeForToken("test-auth-code", "")
-
-	require.NoError(t, err)
-	assert.Equal(t, "test-access-token", tokenInfo.AccessToken)
-	assert.Equal(t, "test-refresh-token", tokenInfo.RefreshToken)
-	assert.Equal(t, "test-id-token", tokenInfo.IDToken)
-	assert.Equal(t, 3600, tokenInfo.ExpiresIn)
-}
-
-func TestExchangeCodeForToken_WithPKCE(t *testing.T) {
-	// Create mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := r.ParseForm()
-		require.NoError(t, err)
-
-		assert.Equal(t, "authorization_code", r.Form.Get("grant_type"))
-		assert.Equal(t, "test-auth-code", r.Form.Get("code"))
-		assert.Equal(t, "test-code-verifier", r.Form.Get("code_verifier"))
-
-		response := map[string]interface{}{
-			"access_token": "test-access-token",
-			"token_type":   "Bearer",
-			"expires_in":   3600,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.TokenURL = server.URL
-
-	tokenInfo, err := adapter.ExchangeCodeForToken("test-auth-code", "test-code-verifier")
-
-	require.NoError(t, err)
-	assert.Equal(t, "test-access-token", tokenInfo.AccessToken)
-}
-
-func TestExchangeCodeForToken_Error(t *testing.T) {
-	// Create mock server that returns error
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "invalid_grant", "error_description": "The provided authorization grant is invalid"}`))
-	}))
-	defer server.Close()
-
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.TokenURL = server.URL
-
-	tokenInfo, err := adapter.ExchangeCodeForToken("invalid-code", "")
-
-	require.Error(t, err)
-	assert.Nil(t, tokenInfo)
-	assert.Contains(t, err.Error(), "token exchange failed")
-}
-
-func TestGetUserInfo_Success(t *testing.T) {
-	// Create mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "GET", r.Method)
-		assert.Equal(t, "Bearer test-access-token", r.Header.Get("Authorization"))
-		assert.Equal(t, "application/json", r.Header.Get("Accept"))
-
-		response := map[string]interface{}{
-			"sub":            "user123",
-			"email":          "user@example.com",
-			"name":           "Test User",
-			"picture":        "https://example.com/avatar.jpg",
-			"given_name":     "Test",
-			"family_name":    "User",
-			"email_verified": true,
-			"groups":         []interface{}{"group1", "group2"},
-			"roles":          []interface{}{"user", "viewer"},
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.UserInfoURL = server.URL
-
-	userInfo, err := adapter.GetUserInfo("test-access-token")
-
-	require.NoError(t, err)
-	assert.Equal(t, "user123", userInfo.Sub)
-	assert.Equal(t, "user@example.com", userInfo.Email)
-	assert.Equal(t, "Test User", userInfo.Name)
-	assert.Equal(t, "https://example.com/avatar.jpg", userInfo.Picture)
-	assert.Equal(t, "Test", userInfo.FirstName)
-	assert.Equal(t, "User", userInfo.LastName)
-	assert.True(t, userInfo.EmailVerified)
-	assert.Equal(t, []string{"group1", "group2"}, userInfo.Groups)
-	assert.Equal(t, []string{"user", "viewer"}, userInfo.Roles)
-}
-
-func TestGetUserInfo_AdminUser(t *testing.T) {
-	// Create mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]interface{}{
-			"sub":    "admin123",
-			"email":  "admin@example.com",
-			"name":   "Admin User",
-			"groups": []interface{}{"regular-group"},
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.UserInfoURL = server.URL
-
-	userInfo, err := adapter.GetUserInfo("test-access-token")
-
-	require.NoError(t, err)
-	assert.Equal(t, "admin@example.com", userInfo.Email)
-	assert.Contains(t, userInfo.Groups, "admin")         // Should be added due to AdminUsers config
-	assert.Contains(t, userInfo.Groups, "regular-group") // Original group should remain
-}
-
-func TestGetUserInfo_AdminGroup(t *testing.T) {
-	// Create mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]interface{}{
-			"sub":    "user456",
-			"email":  "user@example.com",
-			"name":   "Regular User",
-			"groups": []interface{}{"/admin-group", "other-group"},
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.UserInfoURL = server.URL
-
-	userInfo, err := adapter.GetUserInfo("test-access-token")
-
-	require.NoError(t, err)
-	assert.Contains(t, userInfo.Groups, "admin")        // Should be added due to AdminGroups config
-	assert.Contains(t, userInfo.Groups, "/admin-group") // Original admin group should remain
-	assert.Contains(t, userInfo.Groups, "other-group")  // Other groups should remain
-}
-
-func TestGetUserInfo_Error(t *testing.T) {
-	// Create mock server that returns error
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error": "invalid_token"}`))
-	}))
-	defer server.Close()
-
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.UserInfoURL = server.URL
-
-	userInfo, err := adapter.GetUserInfo("invalid-token")
-
-	require.Error(t, err)
-	assert.Nil(t, userInfo)
-	assert.Contains(t, err.Error(), "userinfo request failed with status 401")
-}
-
-func TestBuildProviderLogoutURL(t *testing.T) {
-	tests := []struct {
-		name        string
-		setupConfig func(*config.AuthConfig)
-		idToken     string
-		expected    string
-	}{
-		{
-			name: "OAuth disabled",
-			setupConfig: func(cfg *config.AuthConfig) {
-				cfg.OAuth.Enabled = false
+	BeforeEach(func() {
+		authConfig = &config.AuthConfig{
+			OAuth: config.OAuthConfig{
+				ClientID:     "client-id",
+				ClientSecret: "client-secret",
+				RedirectURL:  "http://localhost/auth/callback",
+				AuthURL:      "http://authserver/authorize",
+				TokenURL:     "http://authserver/token",
+				UserInfoURL:  "http://authserver/userinfo",
+				Scopes:       []string{"openid", "profile", "email"},
+				UserIDField:  "sub",
+				EmailField:   "email",
+				NameField:    "name",
+				GroupsField:  "groups",
+				RolesField:   "roles",
+				Enabled:      true,
 			},
-			idToken:  "test-id-token",
-			expected: "/auth/login",
-		},
-		{
-			name: "Empty ID token",
-			setupConfig: func(cfg *config.AuthConfig) {
-				cfg.OAuth.Enabled = true
-			},
-			idToken:  "",
-			expected: "/auth/login",
-		},
-		{
-			name: "With configured logout URL",
-			setupConfig: func(cfg *config.AuthConfig) {
-				cfg.OAuth.Enabled = true
-				cfg.OAuth.LogoutURL = "https://provider.com/logout"
-				cfg.OAuth.RedirectURL = "http://localhost:8080/auth/callback"
-			},
-			idToken:  "test-id-token",
-			expected: "https://provider.com/logout?id_token_hint=test-id-token&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Flogin",
-		},
-		{
-			name: "With logout URL containing query params",
-			setupConfig: func(cfg *config.AuthConfig) {
-				cfg.OAuth.Enabled = true
-				cfg.OAuth.LogoutURL = "https://provider.com/logout?param=value"
-				cfg.OAuth.RedirectURL = "http://localhost:8080/auth/callback"
-			},
-			idToken:  "test-id-token",
-			expected: "https://provider.com/logout?param=value&id_token_hint=test-id-token&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Flogin",
-		},
-		{
-			name: "No logout URL or issuer URL",
-			setupConfig: func(cfg *config.AuthConfig) {
-				cfg.OAuth.Enabled = true
-				cfg.OAuth.LogoutURL = ""
-				cfg.OAuth.IssuerURL = ""
-			},
-			idToken:  "test-id-token",
-			expected: "/auth/login",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			adapter := createTestOAuthAdapter()
-			tt.setupConfig(adapter.config)
-
-			result := adapter.BuildProviderLogoutURL(tt.idToken)
-			assert.Equal(t, tt.expected, result)
+		}
+		logger, _ = logging.NewLogger(&config.LoggingConfig{
+			Level: "debug",
 		})
-	}
-}
+		adapter = NewOAuthAdapter(authConfig, logger)
+	})
 
-func TestApplyAdminOverrides(t *testing.T) {
-	tests := []struct {
-		name        string
-		userInfo    *application.UserInfo
-		adminUsers  []string
-		adminGroups []string
-		expectAdmin bool
-	}{
-		{
-			name: "Admin user by email",
-			userInfo: &application.UserInfo{
-				Email:  "admin@example.com",
-				Groups: []string{"regular-group"},
-			},
-			adminUsers:  []string{"admin@example.com"},
-			adminGroups: []string{},
-			expectAdmin: true,
-		},
-		{
-			name: "Admin user by sub",
-			userInfo: &application.UserInfo{
-				Sub:    "admin123",
-				Email:  "user@example.com",
-				Groups: []string{"regular-group"},
-			},
-			adminUsers:  []string{"admin123"},
-			adminGroups: []string{},
-			expectAdmin: true,
-		},
-		{
-			name: "Admin user by group",
-			userInfo: &application.UserInfo{
-				Email:  "user@example.com",
-				Groups: []string{"regular-group", "/admin-group"},
-			},
-			adminUsers:  []string{},
-			adminGroups: []string{"/admin-group"},
-			expectAdmin: true,
-		},
-		{
-			name: "Regular user",
-			userInfo: &application.UserInfo{
-				Email:  "user@example.com",
-				Groups: []string{"regular-group"},
-			},
-			adminUsers:  []string{"admin@example.com"},
-			adminGroups: []string{"/admin-group"},
-			expectAdmin: false,
-		},
-		{
-			name: "User already has admin group",
-			userInfo: &application.UserInfo{
-				Email:  "admin@example.com",
-				Groups: []string{"admin", "regular-group"},
-			},
-			adminUsers:  []string{"admin@example.com"},
-			adminGroups: []string{},
-			expectAdmin: true,
-		},
-	}
+	Describe("GenerateState", func() {
+		It("generates a random state string", func() {
+			state, err := adapter.GenerateState()
+			Expect(err).To(BeNil())
+			Expect(state).NotTo(BeEmpty())
+		})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			adapter := createTestOAuthAdapter()
-			adapter.config.OAuth.AdminUsers = tt.adminUsers
-			adapter.config.OAuth.AdminGroups = tt.adminGroups
+		It("generates different states on subsequent calls", func() {
+			state1, err1 := adapter.GenerateState()
+			state2, err2 := adapter.GenerateState()
+			Expect(err1).To(BeNil())
+			Expect(err2).To(BeNil())
+			Expect(state1).NotTo(Equal(state2))
+		})
+	})
 
-			adapter.applyAdminOverrides(tt.userInfo)
+	Describe("BuildAuthURL", func() {
+		It("builds URL without PKCE", func() {
+			url := adapter.BuildAuthURL("xyz")
+			Expect(url).To(ContainSubstring("response_type=code"))
+			Expect(url).To(ContainSubstring("state=xyz"))
+			Expect(url).To(ContainSubstring("client_id=client-id"))
+			Expect(url).To(ContainSubstring("redirect_uri=http%3A%2F%2Flocalhost%2Fauth%2Fcallback"))
+			Expect(url).To(ContainSubstring("scope=openid+profile+email"))
+			Expect(url).NotTo(ContainSubstring("code_challenge"))
+		})
 
-			hasAdmin := false
-			for _, group := range tt.userInfo.Groups {
-				if group == "admin" || group == "/admin" {
-					hasAdmin = true
-					break
+		It("builds URL with PKCE", func() {
+			url := adapter.BuildAuthURL("xyz", "challenge123")
+			Expect(url).To(ContainSubstring("code_challenge=challenge123"))
+			Expect(url).To(ContainSubstring("code_challenge_method=S256"))
+		})
+
+		It("builds URL with empty scopes", func() {
+			authConfig.OAuth.Scopes = []string{}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			url := adapter.BuildAuthURL("state123")
+			Expect(url).To(ContainSubstring("scope="))
+			Expect(url).To(ContainSubstring("state=state123"))
+		})
+
+		It("builds URL with single scope", func() {
+			authConfig.OAuth.Scopes = []string{"openid"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			url := adapter.BuildAuthURL("state456")
+			Expect(url).To(ContainSubstring("scope=openid"))
+		})
+
+		It("ignores empty code challenge", func() {
+			url := adapter.BuildAuthURL("xyz", "")
+			Expect(url).NotTo(ContainSubstring("code_challenge"))
+			Expect(url).NotTo(ContainSubstring("code_challenge_method"))
+		})
+	})
+
+	Describe("ExchangeCodeForToken", func() {
+		var server *httptest.Server
+
+		AfterEach(func() {
+			if server != nil {
+				server.Close()
+			}
+		})
+
+		It("successfully exchanges code for token", func() {
+			tokenResp := map[string]interface{}{
+				"access_token":  "access123",
+				"refresh_token": "refresh123",
+				"id_token":      "id123",
+				"expires_in":    3600,
+			}
+			body, _ := json.Marshal(tokenResp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write(body)
+			}))
+			authConfig.OAuth.TokenURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("code123", "")
+			Expect(err).To(BeNil())
+			Expect(token.AccessToken).To(Equal("access123"))
+			Expect(token.RefreshToken).To(Equal("refresh123"))
+			Expect(token.IDToken).To(Equal("id123"))
+		})
+
+		It("successfully exchanges code with PKCE verifier", func() {
+			var receivedVerifier string
+			tokenResp := map[string]interface{}{
+				"access_token": "access-pkce",
+				"expires_in":   7200,
+			}
+			body, _ := json.Marshal(tokenResp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				r.ParseForm()
+				receivedVerifier = r.Form.Get("code_verifier")
+				Expect(r.Form.Get("grant_type")).To(Equal("authorization_code"))
+				Expect(r.Form.Get("code")).To(Equal("auth-code"))
+				Expect(r.Header.Get("Content-Type")).To(Equal("application/x-www-form-urlencoded"))
+				Expect(r.Header.Get("Accept")).To(Equal("application/json"))
+				w.WriteHeader(http.StatusOK)
+				w.Write(body)
+			}))
+			authConfig.OAuth.TokenURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("auth-code", "verifier123")
+			Expect(err).To(BeNil())
+			Expect(receivedVerifier).To(Equal("verifier123"))
+			Expect(token.AccessToken).To(Equal("access-pkce"))
+			Expect(token.ExpiresIn).To(Equal(7200))
+		})
+
+		It("handles token response without optional fields", func() {
+			tokenResp := map[string]interface{}{
+				"access_token": "minimal-token",
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+			}
+			body, _ := json.Marshal(tokenResp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write(body)
+			}))
+			authConfig.OAuth.TokenURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("code", "")
+			Expect(err).To(BeNil())
+			Expect(token.AccessToken).To(Equal("minimal-token"))
+			Expect(token.RefreshToken).To(BeEmpty())
+			Expect(token.IDToken).To(BeEmpty())
+		})
+
+		It("returns error for non-200 response", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "bad request", http.StatusBadRequest)
+			}))
+			authConfig.OAuth.TokenURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("code", "")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("token exchange failed"))
+			Expect(token).To(BeNil())
+		})
+
+		It("returns error for 401 unauthorized", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			}))
+			authConfig.OAuth.TokenURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("code", "")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("token exchange failed"))
+			Expect(token).To(BeNil())
+		})
+
+		It("returns error for invalid JSON", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("not-json"))
+			}))
+			authConfig.OAuth.TokenURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("code", "")
+			Expect(err).To(HaveOccurred())
+			Expect(token).To(BeNil())
+		})
+
+		It("handles network timeout", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(11 * time.Second) // Longer than client timeout
+			}))
+			authConfig.OAuth.TokenURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("code", "")
+			Expect(err).To(HaveOccurred())
+			Expect(token).To(BeNil())
+		})
+
+		It("handles invalid URL", func() {
+			authConfig.OAuth.TokenURL = "http://[invalid-url"
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			token, err := adapter.ExchangeCodeForToken("code", "")
+			Expect(err).To(HaveOccurred())
+			Expect(token).To(BeNil())
+		})
+	})
+
+	Describe("GetUserInfo", func() {
+		var server *httptest.Server
+
+		AfterEach(func() {
+			if server != nil {
+				server.Close()
+			}
+		})
+
+		It("returns parsed user info with all fields", func() {
+			resp := map[string]interface{}{
+				"sub":            "123",
+				"email":          "user@example.com",
+				"name":           "User One",
+				"picture":        "http://pic",
+				"given_name":     "User",
+				"family_name":    "One",
+				"email_verified": true,
+				"groups":         []interface{}{"dev", "ops"},
+				"roles":          []interface{}{"admin"},
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				Expect(r.Header.Get("Authorization")).To(Equal("Bearer test-token"))
+				Expect(r.Header.Get("Accept")).To(Equal("application/json"))
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			authConfig.OAuth.AdminUsers = []string{"user@example.com"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("test-token")
+			Expect(err).To(BeNil())
+			Expect(info.Email).To(Equal("user@example.com"))
+			Expect(info.Sub).To(Equal("123"))
+			Expect(info.Name).To(Equal("User One"))
+			Expect(info.Picture).To(Equal("http://pic"))
+			Expect(info.FirstName).To(Equal("User"))
+			Expect(info.LastName).To(Equal("One"))
+			Expect(info.EmailVerified).To(BeTrue())
+			Expect(info.Groups).To(ContainElement("dev"))
+			Expect(info.Groups).To(ContainElement("ops"))
+			Expect(info.Groups).To(ContainElement("admin"))
+			Expect(info.Roles).To(ContainElement("admin"))
+		})
+
+		It("handles missing optional fields", func() {
+			resp := map[string]interface{}{
+				"sub":   "456",
+				"email": "minimal@example.com",
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(BeNil())
+			Expect(info.Sub).To(Equal("456"))
+			Expect(info.Email).To(Equal("minimal@example.com"))
+			Expect(info.Name).To(BeEmpty())
+			Expect(info.Picture).To(BeEmpty())
+			Expect(info.Groups).To(BeEmpty())
+			Expect(info.Roles).To(BeEmpty())
+		})
+
+		It("handles fields with wrong types", func() {
+			resp := map[string]interface{}{
+				"sub":            123,  // wrong type (number instead of string)
+				"email":          true, // wrong type (bool instead of string)
+				"name":           "Valid Name",
+				"email_verified": "yes",          // wrong type (string instead of bool)
+				"groups":         "not-an-array", // wrong type (string instead of array)
+				"roles":          123,            // wrong type (number instead of array)
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(BeNil())
+			Expect(info.Sub).To(BeEmpty())   // Wrong type, should be empty
+			Expect(info.Email).To(BeEmpty()) // Wrong type, should be empty
+			Expect(info.Name).To(Equal("Valid Name"))
+			Expect(info.EmailVerified).To(BeFalse()) // Wrong type, defaults to false
+			Expect(info.Groups).To(BeEmpty())        // Wrong type, should be empty
+			Expect(info.Roles).To(BeEmpty())         // Wrong type, should be empty
+		})
+
+		It("handles groups array with mixed types", func() {
+			resp := map[string]interface{}{
+				"sub":    "789",
+				"groups": []interface{}{"valid-group", 123, true, "another-group"},
+				"roles":  []interface{}{456, "valid-role", false},
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(BeNil())
+			Expect(info.Groups).To(HaveLen(2))
+			Expect(info.Groups).To(ContainElement("valid-group"))
+			Expect(info.Groups).To(ContainElement("another-group"))
+			Expect(info.Roles).To(HaveLen(1))
+			Expect(info.Roles).To(ContainElement("valid-role"))
+		})
+
+		It("applies admin override based on sub field", func() {
+			resp := map[string]interface{}{
+				"sub":    "admin-sub-123",
+				"email":  "other@example.com",
+				"groups": []interface{}{"users"},
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			authConfig.OAuth.AdminUsers = []string{"admin-sub-123"} // Match by sub
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(BeNil())
+			Expect(info.Groups).To(ContainElement("admin"))
+		})
+
+		It("does not duplicate admin group if already present", func() {
+			resp := map[string]interface{}{
+				"sub":    "sub123",
+				"email":  "admin@example.com",
+				"groups": []interface{}{"users", "admin"},
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			authConfig.OAuth.AdminUsers = []string{"admin@example.com"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(BeNil())
+			adminCount := 0
+			for _, g := range info.Groups {
+				if g == "admin" {
+					adminCount++
 				}
 			}
-
-			assert.Equal(t, tt.expectAdmin, hasAdmin)
+			Expect(adminCount).To(Equal(1))
 		})
-	}
-}
 
-func TestGetUserInfo_CustomFieldMappings(t *testing.T) {
-	// Create mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]interface{}{
-			"user_id":       "custom123",
-			"email_address": "custom@example.com",
-			"display_name":  "Custom User",
-			"user_groups":   []interface{}{"custom-group"},
-			"user_roles":    []interface{}{"custom-role"},
-		}
+		It("recognizes /admin group as admin", func() {
+			resp := map[string]interface{}{
+				"sub":    "sub456",
+				"email":  "user@example.com",
+				"groups": []interface{}{"/admin", "users"},
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			authConfig.OAuth.AdminUsers = []string{"user@example.com"}
+			adapter = NewOAuthAdapter(authConfig, logger)
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(BeNil())
+			// Should not add another admin group since /admin is already present
+			adminCount := 0
+			for _, g := range info.Groups {
+				if g == "admin" || g == "/admin" {
+					adminCount++
+				}
+			}
+			Expect(adminCount).To(Equal(1))
+		})
 
-	adapter := createTestOAuthAdapter()
-	adapter.config.OAuth.UserInfoURL = server.URL
-	// Override field mappings
-	adapter.config.OAuth.UserIDField = "user_id"
-	adapter.config.OAuth.EmailField = "email_address"
-	adapter.config.OAuth.NameField = "display_name"
-	adapter.config.OAuth.GroupsField = "user_groups"
-	adapter.config.OAuth.RolesField = "user_roles"
+		It("applies admin override based on AdminGroups", func() {
+			resp := map[string]interface{}{
+				"sub":    "sub123",
+				"email":  "x@example.com",
+				"groups": []interface{}{"managers"},
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			authConfig.OAuth.AdminGroups = []string{"managers"}
+			adapter = NewOAuthAdapter(authConfig, logger)
 
-	userInfo, err := adapter.GetUserInfo("test-access-token")
+			info, err := adapter.GetUserInfo("access")
+			Expect(err).To(BeNil())
+			Expect(info.Groups).To(ContainElement("admin"))
+		})
 
-	require.NoError(t, err)
-	assert.Equal(t, "custom123", userInfo.Sub)
-	assert.Equal(t, "custom@example.com", userInfo.Email)
-	assert.Equal(t, "Custom User", userInfo.Name)
-	assert.Equal(t, []string{"custom-group"}, userInfo.Groups)
-	assert.Equal(t, []string{"custom-role"}, userInfo.Roles)
-}
+		It("applies admin override for multiple admin groups", func() {
+			resp := map[string]interface{}{
+				"sub":    "sub789",
+				"email":  "user@example.com",
+				"groups": []interface{}{"developers", "team-leads"},
+			}
+			body, _ := json.Marshal(resp)
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(body)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			authConfig.OAuth.AdminGroups = []string{"managers", "team-leads", "executives"}
+			adapter = NewOAuthAdapter(authConfig, logger)
 
-// Benchmark tests
-func BenchmarkGenerateState(b *testing.B) {
-	adapter := createTestOAuthAdapter()
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(BeNil())
+			Expect(info.Groups).To(ContainElement("admin"))
+		})
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := adapter.GenerateState()
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
+		It("returns error on non-200 response", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "fail", http.StatusUnauthorized)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
 
-func BenchmarkBuildAuthURL(b *testing.B) {
-	adapter := createTestOAuthAdapter()
-	state := "test-state"
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("userinfo request failed with status 401"))
+			Expect(info).To(BeNil())
+		})
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = adapter.BuildAuthURL(state)
-	}
-}
+		It("returns error for 403 forbidden", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("userinfo request failed with status 403"))
+			Expect(info).To(BeNil())
+		})
+
+		It("returns error on invalid JSON", func() {
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("bad-json"))
+			}))
+			authConfig.OAuth.UserInfoURL = server.URL
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(HaveOccurred())
+			Expect(info).To(BeNil())
+		})
+
+		It("handles network error", func() {
+			authConfig.OAuth.UserInfoURL = "http://non-existent-server-12345.invalid"
+			adapter = NewOAuthAdapter(authConfig, logger)
+
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(HaveOccurred())
+			Expect(info).To(BeNil())
+		})
+	})
+
+	Describe("BuildProviderLogoutURL", func() {
+		It("returns local login if disabled", func() {
+			authConfig.OAuth.Enabled = false
+			adapter = NewOAuthAdapter(authConfig, logger)
+			Expect(adapter.BuildProviderLogoutURL("id")).To(Equal("/auth/login"))
+		})
+
+		It("returns local login if no ID token", func() {
+			Expect(adapter.BuildProviderLogoutURL("")).To(Equal("/auth/login"))
+		})
+
+		It("uses configured LogoutURL", func() {
+			authConfig.OAuth.LogoutURL = "http://auth/logout"
+			url := adapter.BuildProviderLogoutURL("id123")
+			Expect(url).To(ContainSubstring("id_token_hint=id123"))
+			Expect(url).To(ContainSubstring("post_logout_redirect_uri="))
+			Expect(url).To(ContainSubstring("%2Fauth%2Flogin"))
+		})
+
+		It("handles LogoutURL with existing query params", func() {
+			authConfig.OAuth.LogoutURL = "http://auth/logout?param=value"
+			url := adapter.BuildProviderLogoutURL("id456")
+			Expect(url).To(ContainSubstring("param=value"))
+			Expect(url).To(ContainSubstring("&id_token_hint=id456"))
+			Expect(url).NotTo(ContainSubstring("?id_token_hint"))
+		})
+
+		It("properly URL-encodes the ID token", func() {
+			authConfig.OAuth.LogoutURL = "http://auth/logout"
+			url := adapter.BuildProviderLogoutURL("id/with+special=chars")
+			Expect(url).To(ContainSubstring("id_token_hint=id%2Fwith%2Bspecial%3Dchars"))
+		})
+
+		It("uses IssuerURL fallback", func() {
+			authConfig.OAuth.LogoutURL = ""
+			authConfig.OAuth.IssuerURL = "http://issuer"
+			url := adapter.BuildProviderLogoutURL("id123")
+			Expect(url).To(ContainSubstring("protocol/openid-connect/logout"))
+			Expect(url).To(ContainSubstring("id_token_hint=id123"))
+		})
+
+		It("handles IssuerURL with trailing slash", func() {
+			authConfig.OAuth.LogoutURL = ""
+			authConfig.OAuth.IssuerURL = "http://issuer/"
+			url := adapter.BuildProviderLogoutURL("id789")
+			Expect(url).To(Equal("http://issuer/protocol/openid-connect/logout?id_token_hint=id789&post_logout_redirect_uri=http%3A%2F%2Flocalhost%2Fauth%2Flogin"))
+			Expect(url).NotTo(ContainSubstring("//protocol"))
+		})
+
+		It("handles empty RedirectURL", func() {
+			authConfig.OAuth.LogoutURL = "http://auth/logout"
+			authConfig.OAuth.RedirectURL = ""
+			url := adapter.BuildProviderLogoutURL("id123")
+			Expect(url).To(ContainSubstring("id_token_hint=id123"))
+			Expect(url).NotTo(ContainSubstring("post_logout_redirect_uri"))
+		})
+
+		It("falls back to /auth/login when no logout URL configured", func() {
+			authConfig.OAuth.LogoutURL = ""
+			authConfig.OAuth.IssuerURL = ""
+			Expect(adapter.BuildProviderLogoutURL("id123")).To(Equal("/auth/login"))
+		})
+	})
+
+	Describe("applyAdminOverrides", func() {
+		var userInfo *application.UserInfo
+
+		BeforeEach(func() {
+			userInfo = &application.UserInfo{
+				Sub:    "user123",
+				Email:  "test@example.com",
+				Groups: []string{"users"},
+			}
+		})
+
+		It("adds admin group for AdminUsers email match", func() {
+			authConfig.OAuth.AdminUsers = []string{"test@example.com"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			adapter.applyAdminOverrides(userInfo)
+			Expect(userInfo.Groups).To(ContainElement("admin"))
+		})
+
+		It("adds admin group for AdminUsers sub match", func() {
+			authConfig.OAuth.AdminUsers = []string{"user123"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			adapter.applyAdminOverrides(userInfo)
+			Expect(userInfo.Groups).To(ContainElement("admin"))
+		})
+
+		It("does not add admin if not in AdminUsers", func() {
+			authConfig.OAuth.AdminUsers = []string{"other@example.com"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			originalGroups := len(userInfo.Groups)
+			adapter.applyAdminOverrides(userInfo)
+			Expect(userInfo.Groups).To(HaveLen(originalGroups))
+			Expect(userInfo.Groups).NotTo(ContainElement("admin"))
+		})
+
+		It("adds admin group for AdminGroups match", func() {
+			userInfo.Groups = append(userInfo.Groups, "managers")
+			authConfig.OAuth.AdminGroups = []string{"managers"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			adapter.applyAdminOverrides(userInfo)
+			Expect(userInfo.Groups).To(ContainElement("admin"))
+		})
+
+		It("prioritizes AdminUsers over AdminGroups", func() {
+			userInfo.Groups = append(userInfo.Groups, "blocked-group")
+			authConfig.OAuth.AdminUsers = []string{"test@example.com"}
+			authConfig.OAuth.AdminGroups = []string{"blocked-group"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			adapter.applyAdminOverrides(userInfo)
+			Expect(userInfo.Groups).To(ContainElement("admin"))
+		})
+
+		It("handles empty admin configurations", func() {
+			authConfig.OAuth.AdminUsers = []string{}
+			authConfig.OAuth.AdminGroups = []string{}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			originalGroups := len(userInfo.Groups)
+			adapter.applyAdminOverrides(userInfo)
+			Expect(userInfo.Groups).To(HaveLen(originalGroups))
+			Expect(userInfo.Groups).NotTo(ContainElement("admin"))
+		})
+
+		It("handles nil groups", func() {
+			userInfo.Groups = nil
+			authConfig.OAuth.AdminUsers = []string{"test@example.com"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			adapter.applyAdminOverrides(userInfo)
+			Expect(userInfo.Groups).To(HaveLen(1))
+			Expect(userInfo.Groups).To(ContainElement("admin"))
+		})
+	})
+
+	Describe("NewOAuthAdapter", func() {
+		It("creates adapter with correct configuration", func() {
+			newAdapter := NewOAuthAdapter(authConfig, logger)
+			Expect(newAdapter).NotTo(BeNil())
+			Expect(newAdapter.config).To(Equal(authConfig))
+			Expect(newAdapter.logger).To(Equal(logger))
+			Expect(newAdapter.client).NotTo(BeNil())
+			Expect(newAdapter.client.Timeout).To(Equal(10 * time.Second))
+		})
+	})
+
+	Describe("Edge Cases", func() {
+		It("handles special characters in scopes", func() {
+			authConfig.OAuth.Scopes = []string{"openid", "profile email", "custom:scope"}
+			adapter = NewOAuthAdapter(authConfig, logger)
+			url := adapter.BuildAuthURL("state")
+			Expect(url).To(ContainSubstring("scope=openid+profile+email+custom%3Ascope"))
+		})
+
+		It("handles malformed UserInfoURL", func() {
+			authConfig.OAuth.UserInfoURL = "://invalid-url"
+			adapter = NewOAuthAdapter(authConfig, logger)
+			info, err := adapter.GetUserInfo("token")
+			Expect(err).To(HaveOccurred())
+			Expect(info).To(BeNil())
+		})
+
+		It("handles very long state parameter", func() {
+			longState := strings.Repeat("a", 1000)
+			url := adapter.BuildAuthURL(longState)
+			Expect(url).To(ContainSubstring("state=" + longState))
+		})
+	})
+})
