@@ -7,12 +7,12 @@
 
 ## ⚡ Choose Your Path
 
-| Time Available | Method                                                       | Best For                       |
-|----------------|--------------------------------------------------------------|--------------------------------|
-| **2 minutes**  | [Docker Quick Start](#-2-minute-docker-quick-start)          | Quick evaluation               |
-| **15 minutes** | [Full Local Setup](#-15-minute-full-setup)                   | Developers ready to explore    |
-| **20 minutes** | [Full Local Development](#-20-minute-full-local-development) | Developers ready to contribute |
-| **30 minutes** | [Production Ready](#-30-minute-production-setup)             | Teams preparing for deployment |
+| Time Available  | Method                                                  | Best For                            |
+|-----------------|---------------------------------------------------------|-------------------------------------|
+| **2 minutes**   | [Docker Quick Start](#-2-minute-docker-quick-start)     | Quick evaluation                    |
+| **15 minutes**  | [Full Local Setup](#-15-minute-full-setup)              | Developers ready to explore         |
+| **+5 minutes**  | [IDE Debugging](#-ide-debugging-extends-15-minute-setup) | Contributors who want breakpoints   |
+| **30 minutes**  | [Production Ready](#-30-minute-production-setup)        | Teams preparing for deployment      |
 
 ---
 
@@ -168,9 +168,11 @@ cd fern-platform
 # This single command:
 # 1. Creates k3d cluster with port mappings
 # 2. Installs KubeVela and CloudNativePG operators
-# 3. Deploys PostgreSQL and Fern Platform
-# 4. Builds and loads Docker image
+# 3. Builds Fern Platform from your local source and loads it into k3d
+# 4. Deploys PostgreSQL, Keycloak, and Fern Platform (using your locally-built image)
 # 5. Opens browser automatically
+#
+# To pick up code changes, just re-run `make deploy-all` — it rebuilds and redeploys.
 make deploy-all
 
 # After deployment completes, the browser will open to:
@@ -216,115 +218,59 @@ open http://fern-platform.local:8080
 
 ---
 
-## 🔥 20-Minute Full Local Development
+## 🐛 IDE Debugging (extends 15-minute setup)
 
-**Perfect for:** Developers who want to contribute to making Fern great!
+**Perfect for:** Contributors who want to set breakpoints and step through Fern Platform code.
 
-### Step 1: Prerequisites (5 minutes)
+This builds on the 15-minute setup. After `make deploy-all` is running, you can run Fern Platform from your IDE on port 8081, reusing the cluster's Postgres and Keycloak. The k3d load balancer stays running throughout — do not stop it.
 
-#### 1. Install Required Tools
+### Step 1: Add hosts entry for Postgres
 
-Fern Platform supports Linux, macOS, and Windows. Choose your installation method:
-
-**macOS (Homebrew)**
-```bash
-brew install k3d kubectl helm go
-
-# Install vela CLI
-curl -fsSl https://kubevela.io/script/install.sh | bash
-```
-
-**Linux**
+The app resolves Postgres as `localhost.fern-platform` (Kubernetes DNS format). Add an alias so it resolves on your host:
 
 ```bash
-TBD
+sudo sh -c 'echo "127.0.0.1 localhost.fern-platform" >> /etc/hosts'
 ```
 
-**Windows (PowerShell as Administrator)**
-```powershell
-TDB
-```
+Verify all required entries are present:
 
-**For other installation methods:**
-- k3d: https://k3d.io/stable/#installation
-- kubectl: https://kubernetes.io/docs/tasks/tools/
-- helm: https://helm.sh/docs/intro/install/
-- vela: https://kubevela.io/docs/installation/kubernetes#install-vela-cli
-- go: https://go.dev/doc/install
-
-#### 2. Configure hosts file (Required for OAuth)
-
-**macOS/Linux**
 ```bash
-# Add these entries to /etc/hosts for OAuth authentication to work:
-sudo sh -c 'echo "127.0.0.1 fern-platform.local" >> /etc/hosts'
-sudo sh -c 'echo "127.0.0.1 keycloak" >> /etc/hosts'
-
-# Verify entries were added:
 cat /etc/hosts | grep -E "fern-platform|keycloak"
+# Should show:
+# 127.0.0.1 fern-platform.local
+# 127.0.0.1 keycloak
+# 127.0.0.1 localhost.fern-platform
 ```
 
-**Windows (PowerShell as Administrator)**
-```powershell
-TBD
-```
+### Step 2: Port-forward Postgres so the IDE can reach it
 
-> ⚠️ **Important**: Without these /etc/hosts entries, OAuth login will fail with redirect errors.
+In a separate terminal (this command blocks; keep it open):
 
-### Step 2: Build Fern Platform Locally and Deploy using Kubevela (10 minutes)
 ```bash
-# Clone and setup everything
-git clone https://github.com/guidewire-oss/fern-platform
-cd fern-platform
-```
-In the file `deployments/fern-platform-kubevela.yaml`, update the lines:
-```
-image: ghcr.io/guidewire-oss/fern-platform:0.1.0
-imagePullPolicy: Always
-```
-To:
-```
-image: docker.io/library/fern-platform:latest
-imagePullPolicy: Never
-```
-And run the command:
-```bash
-make deploy-all
-```
-
-### Step 3: Verify Everything Works
-```bash
-# 1. Check all pods are running
-kubectl get pods -n fern-platform
-
-# 2. Test health endpoint  
-curl http://localhost:8080/health
-
-# 3. Access the application
-open http://localhost:8080
-```
-
-### Step 4: Setup up development environment for IDE Debugging (5 minutes)
-In this step, we will be starting the Fern Platform in IDE, and connecting to the Keycloak and Postgres deployed in Step 2.
-
-#### Expose port 5432 on the K3d cluster
-This will allow connecting to Postgres from host machine
-```bash
-# Open a new terminal. The next command will block; we will need to keep the terminal open
 kubectl port-forward -n fern-platform svc/postgres-rw 5432:5432
 ```
 
-#### Set Fern Platform config to connect to Keycloak and Postgres
-```
-# open the `fern-platform` project in your favorite IDE
+### Step 3: Get the Postgres password
 
-# Update config/config.yaml by replacing the `database` and `auth` sections with following:
+```bash
+kubectl get secret -n fern-platform postgres-app -o jsonpath='{.data.password}' | base64 -d
+```
+
+Copy the output — you'll need it in the next step.
+
+### Step 4: Update `config/config.yaml`
+
+Update the `server`, `database`, and `auth` sections of `config/config.yaml`, replacing `<password>` with the value from Step 3. Run from the repo root so the config file is picked up correctly.
+
+```yaml
+server:
+  port: 8081
 
 database:
   host: "localhost"
   port: 5432
   user: "app"
-  password: "<DB_Password_From_Terminal"
+  password: "<password from Step 3>"
   dbname: "app"
   sslmode: "disable"
   timezone: "UTC"
@@ -335,55 +281,43 @@ database:
 
 auth:
   enabled: true
-  jwtSecret: ""
   jwksUrl: "http://keycloak:8080/realms/fern-platform/protocol/openid-connect/certs"
   issuer: "http://keycloak:8080/realms/fern-platform"
   audience: "fern-platform-web"
-  tokenExpiry: "24h"
-  refreshExpiry: "168h"
   oauth:
     enabled: true
     clientId: "fern-platform-web"
     clientSecret: "fern-platform-client-secret"
-    redirectUrl: "http://localhost:8080/auth/callback"
-    scopes: [ "openid", "profile", "email" ]
-    adminGroups: [ "fern-admin" ]
-
-    # OAuth endpoints (required)
+    redirectUrl: "http://localhost:8081/auth/callback"
+    scopes: "openid,profile,email,groups"
     authUrl: "http://keycloak:8080/realms/fern-platform/protocol/openid-connect/auth"
     tokenUrl: "http://keycloak:8080/realms/fern-platform/protocol/openid-connect/token"
     userInfoUrl: "http://keycloak:8080/realms/fern-platform/protocol/openid-connect/userinfo"
     jwksUrl: "http://keycloak:8080/realms/fern-platform/protocol/openid-connect/certs"
+    issuerUrl: "http://keycloak:8080/realms/fern-platform"
     logoutUrl: "http://keycloak:8080/realms/fern-platform/protocol/openid-connect/logout"
+    introspectionUrl: "http://keycloak:8080/realms/fern-platform/protocol/openid-connect/token/introspect"
+    introspectionClientId: "fern-platform-introspection"
+    introspectionClientSecret: "fern-introspection-secret"
+    adminUsers: "admin@fern.com"
 ```
-#### Run/debug Fern Platform from IDE
+
+> 💡 Keep your local `config/config.yaml` overrides out of commits — the cluster password is environment-specific.
+
+### Step 5: Run Fern Platform from your IDE
+
+Run from the repo root:
+
 ```bash
-# Start Fern Platform by running
 go run cmd/fern-platform/main.go
-
-# UI is accessible from http://localhost:8080
-# The login credentials are available in section below 
 ```
 
-### Test Credentials
-```bash
-# Multiple test users are available with different permission levels
-# See docs/configuration/test-users.md for complete list
+Or run/debug `cmd/fern-platform/main.go` from your IDE with the working directory set to the repo root.
 
-# Example users:
-Admin: admin@fern.com / test123 (full system access)
-Manager: fern-manager@fern.com / test123 (can edit fern team projects)
-User: fern-user@fern.com / test123 (read-only access to fern team)
-```
+Open `http://localhost:8081` and log in with the test credentials (e.g. `admin@fern.com / test123`).
 
-### What You Get
-- ✅ **Full OAuth flow** with Keycloak
-- ✅ **Admin vs user roles** and permissions
-- ✅ **Real database** with migrations
-- ✅ **All APIs** (REST + GraphQL)
-- ✅ **Modern web UI** with treemap visualization
-- ✅ **Multi-framework test data** support
-- 🚧 **AI features planned** (not yet implemented)
+> ℹ️ The cluster instance remains accessible at `http://fern-platform.local:8080`.
+
 ---
 
 ## 🏢 30-Minute Production Setup
